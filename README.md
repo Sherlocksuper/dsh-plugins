@@ -6,6 +6,10 @@ DeepSeek Harness（DSH）Web GUI 的插件集合。
 |---|---|
 | [side-chat](side-chat/) | 输入 `/` 选「侧边栏会话」，在右侧栏开一段临时旁支对话：继承主对话上下文、用原生输入框；使用期间以“未分组”一行存在，关闭标签后归档隐藏。 |
 
+## 设计笔记
+
+开发过程里对 DSH 内部接口的调研记录（已脱敏）放在 [docs/notes](docs/notes/)：Codex `/side` 的行为规格、侧栏 tab/资源协议、斜杠命令 API、workspace bundle 格式、Host 侧会话创建与隐藏。
+
 ## 安装
 
 每个插件目录都是一个 workspace bundle，在 DSH 的插件管理器里用绝对路径安装：
