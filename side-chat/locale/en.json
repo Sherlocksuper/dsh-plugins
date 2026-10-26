@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Side Chat",
+    "description": "Type / and pick Side Chat to open a temporary side conversation with the resident composer in the right Sidebar: it inherits the main conversation context; while open it is one \"Ungrouped\" row, and closing the tab archives it."
+  }
+}

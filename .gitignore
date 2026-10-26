@@ -1,0 +1,7 @@
+# Agent research notes, not part of the published plugin sources.
+research/
+
+# Local noise
+.DS_Store
+node_modules/
+*.log

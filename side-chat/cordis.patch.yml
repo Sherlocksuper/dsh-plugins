@@ -1,0 +1,3 @@
+- insert:
+    - id: side-chat
+      name: '@local/side-chat'
