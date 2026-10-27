@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "Side Chat",
-    "description": "Type / and pick Side Chat to fork the main history and sync new parent records before each question, with the native composer. Closing the tab archives the conversation."
+    "title": "Side chat",
+    "description": "Open multiple temporary snapshot forks beside the main chat. Closing a side chat discards it."
   }
 }

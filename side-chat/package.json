@@ -1,12 +1,12 @@
 {
   "name": "@local/side-chat",
-  "version": "1.1.0",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
-  "description": "Side conversation with a native history fork, incremental parent synchronization, and the resident DSH composer.",
+  "description": "Temporary side chats with snapshot forks, native DSH input, multiple tabs and no saved session logs.",
   "scripts": {
     "test": "node --test test/*.test.js",
-    "check": "node --check index.js && node --check context.js && node --check client.js"
+    "check": "node --check index.js && node --check runtime.js && node --check client.js"
   },
   "exports": {
     ".": "./index.js",
@@ -16,7 +16,7 @@
   },
   "files": [
     "index.js",
-    "context.js",
+    "runtime.js",
     "client.js",
     "prompts/AGENTS.md",
     "cordis.patch.yml",
@@ -24,7 +24,9 @@
     "icon.svg"
   ],
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "immediately": true,
@@ -36,7 +38,9 @@
         "@deepseek-ai/dsh-client-ui-conversation",
         "@deepseek-ai/dsh-client-ui-input-trigger",
         "@deepseek-ai/dsh-client-ui-sidebar-right",
-        "@deepseek-ai/dsh-client-ui-workspace"
+        "@deepseek-ai/dsh-client-ui-workspace",
+        "@deepseek-ai/dsh-client-shortcuts",
+        "@deepseek-ai/dsh-session-log-export"
       ]
     }
   }

@@ -1,15 +1,16 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { Readable } from 'node:stream';
+import { EventEmitter } from 'node:events';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import * as sideChat from '../index.js';
 
 const runtimeRoot = process.env.DSH_RUNTIME_ROOT;
 
-test('native DSH fork, request synchronization, dedicated rules, and committed cursor', {
+test('memory-only native forks, independent snapshots, close, and transport idempotency', {
   skip: runtimeRoot === undefined ? 'Set DSH_RUNTIME_ROOT to an unpacked DSH runtime to run integration checks' : false,
   timeout: 10000,
 }, async () => {
@@ -19,10 +20,10 @@ test('native DSH fork, request synchronization, dedicated rules, and committed c
   const [
     { Context }, { default: Sessions }, { default: Agents }, { default: AgentLoop },
     { default: SystemPrompt }, { default: Projections }, { default: Query },
-    { default: Tools }, { default: Llm, LlmAdapter, createUserMessage }, Persistence, { default: SandboxPolicy },
+    { default: Tools, defineTool }, { default: Llm, LlmAdapter, createUserMessage }, Persistence, { default: SandboxPolicy }, Checkpoints,
   ] = await Promise.all([
     'cordis', 'dsh-session', 'dsh-agent', 'dsh-agent-loop', 'dsh-system-prompt',
-    'dsh-session-projection', 'dsh-session-query', 'dsh-tools', 'dsh-llm', 'dsh-session-persistence-jsonl', 'dsh-sandbox-policy',
+    'dsh-session-projection', 'dsh-session-query-sqlite', 'dsh-tools', 'dsh-llm', 'dsh-session-persistence-jsonl', 'dsh-sandbox-policy', 'dsh-session-checkpoint-policy',
   ].map(load));
   const root = new Context();
   root.on('internal/error', (error) => { console.error(error); });
@@ -52,22 +53,15 @@ test('native DSH fork, request synchronization, dedicated rules, and committed c
   root.plugin(SandboxPolicy, { mode: 'read-only' });
   root.plugin(Tools, {});
   root.plugin(Llm);
-  let failParentRead = false;
-  class FixtureQuery extends Query {
-    observeSession(id, options) {
-      if (failParentRead && id === 'fixture-parent') {
-        throw new Error('fixture read failure');
-      }
-      return super.observeSession(id, options);
-    }
-  }
-  root.plugin(FixtureQuery, {});
+  root.plugin(Checkpoints);
+  root.plugin(Query, { path: ':memory:', openAt: 'first-search' });
   const persistenceRoot = await mkdtemp(resolve(tmpdir(), 'side-chat-runtime-'));
   await root.plugin(Persistence, { root: persistenceRoot, compression: 'none', listConcurrency: 1 }).await();
   root.inject(['sessionPersistence'], (scope) => {
     scope.plugin(AgentLoop, { agents: [], maxParallelToolCalls: 10 });
   });
   root.plugin({ name: 'fixture-services', inject: ['llm'], apply(ctx) {
+    ctx.provide('sessionController', { listState: { summaryFor: (session) => ({ sessionId: session.id, parentSessionId: session.header.parentSession, origin: session.header.origin }) } });
     ctx.provide('connection', { requestRejection: () => undefined });
     ctx.provide('webServer', { register(value) { route = value; return () => {}; } });
     ctx.provide('workingDirectory', { get: (session) => session.header.cwd });
@@ -80,6 +74,14 @@ test('native DSH fork, request synchronization, dedicated rules, and committed c
     ctx.get('llm').registerAdapter(['fixture'], new FixtureModel());
   } });
   root.plugin(sideChat);
+  let subagentCalls = 0;
+  root.plugin({ name: 'fixture-subagent-tool', inject: ['tools'], apply(ctx) {
+    ctx.get('tools').register(defineTool({
+      name: 'subagent', description: 'Fixture delegation', parameters: {},
+      output: { schema: { type: 'string' }, render: (_args, value) => [{ type: 'text', text: value }] },
+      execute() { subagentCalls++; return 'delegated'; },
+    }));
+  } });
 
   async function rpc(method, payload) {
     const body = JSON.stringify({ type: 'client-request', rpcId: method, method, payload });
@@ -115,72 +117,93 @@ test('native DSH fork, request synchronization, dedicated rules, and committed c
     assert.equal(requests.length, 1);
     assert.equal(parent.session.deriveMessages().at(-1).role, 'assistant');
     parent.session.append('sandbox/mode', { mode: 'read-only', source: 'user' });
-    const opened = await rpc('open', { parentSessionId: parent.id });
-    assert.equal(opened.ok, true);
-    let child = root.get('agents').get(opened.value.childId);
+    const opened = await rpc('open', { parentSessionId: parent.id, requestId: 'first-open' });
+    assert.equal(opened.ok, true, JSON.stringify(opened));
+    const childId = opened.value.childId;
+    const child = root.get('agents').get(childId);
     assert.equal(child.session.header.parentSession, parent.id);
+    assert.equal(child.session.header.origin, undefined, 'native prompts must keep ordinary routing');
     assert.equal(root.get('sandboxPolicy').resolve({ session: child.session }).mode, 'read-only');
     assert.deepEqual(child.session.deriveMessages(), parent.session.deriveMessages());
+    const summary = root.get('sessionController').listState.summaryFor(child.session);
+    assert.equal(summary.origin, 'subagent', 'the navigation summary uses the existing hidden marker');
+    assert.equal(summary.parentSessionId, undefined, 'do not synthesize a subagent prompt address');
+    assert.equal(Object.hasOwn(summary, 'parentSessionId'), false, 'wire data must omit absent fields rather than serialize undefined');
+    assert.equal(root.get('sessionController').listState.summaryFor(parent.session).origin, undefined);
+    assert.ok(!(await root.get('sessionQuery').listSessions()).some((record) => record.header.id === childId), 'temporary sessions must not enter history queries');
+    assert.equal((await root.get('sessionQuery').filterSessions([{ kind: 'id', values: [childId] }])).length, 0);
+    const diskBefore = await readdir(persistenceRoot, { recursive: true });
+    assert.ok(!diskBefore.some((name) => name.includes(childId)), 'no side-chat storage handle or log');
+
     parent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'fresh parent detail' }] }));
     await parent.whenIdle();
     child.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'side question' }] }));
     await child.whenIdle();
     const sideRequest = requests.at(-1);
-    assert.equal(sideRequest.sessionId, child.id);
-    const update = sideRequest.messages.find((message) => message.source.kind === 'side-chat:sync');
-    assert.ok(update, 'a sync message must reach the real model request');
-    assert.match(JSON.stringify(update), /fresh parent detail/);
-    assert.match(JSON.stringify(sideRequest.messages[0]), /侧聊行为规则/);
-    child.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'another side question' }] }));
-    await child.whenIdle();
-    assert.equal(requests.at(-1).messages.filter((message) => message.source.kind === 'side-chat:sync').length, 1);
-    const attached = await rpc('attach', { parentSessionId: parent.id, childId: child.id });
-    assert.equal(attached.ok, true);
-    assert.deepEqual(attached.value.inheritedTurns, [1]);
+    assert.equal(sideRequest.sessionId, childId);
+    assert.doesNotMatch(JSON.stringify(sideRequest.messages), /fresh parent detail/);
+    assert.match(JSON.stringify(sideRequest.messages), /initial parent question/);
+    assert.match(JSON.stringify(sideRequest.messages), /侧聊行为规则/);
+    assert.equal(sideRequest.messages.filter((message) => message.source.kind === 'side-chat:boundary').length, 1);
+    assert.equal(errors.length, 0, errors.map((error) => error.stack).join('\n'));
+    const search = await root.get('sessionQuery').searchSessions({ query: 'initial parent', limit: 20 });
+    assert.ok(search.items.some((hit) => hit.header.id === parent.id));
+    assert.ok(!search.items.some((hit) => hit.header.id === childId), 'full-text search cannot disclose transient side chats');
 
-    // A stale binding must recover its cursor from committed log records.
-    assert.equal((await rpc('detach', { childId: child.id })).ok, true);
-    assert.equal((await rpc('attach', { parentSessionId: parent.id, childId: child.id })).ok, true);
-    child.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'after refresh' }] }));
-    await child.whenIdle();
-    assert.equal(requests.at(-1).messages.filter((message) => message.source.kind === 'side-chat:sync').length, 1);
+    const tools = root.get('tools');
+    const denied = await tools.execute({ name: 'subagent', arguments: {}, agent: child, callId: 'side-call', signal: new AbortController().signal });
+    assert.equal(denied.isError, true);
+    assert.equal(subagentCalls, 0);
+    const allowed = await tools.execute({ name: 'subagent', arguments: {}, agent: parent, callId: 'main-call', signal: new AbortController().signal });
+    assert.equal(allowed.isError, false);
+    assert.equal(subagentCalls, 1, 'the side guard must not restrict the main chat');
 
-    // A sync failure must block the provider and preserve the human question.
-    const beforeFailure = requests.length;
-    failParentRead = true;
-    child.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'keep this question' }] }));
-    await child.whenIdle();
-    assert.equal(requests.length, beforeFailure);
-    assert.match(errors.at(-1).message, /增量同步失败/);
-    const queued = child.inbox.nextTurn.find((message) => JSON.stringify(message.content).includes('keep this question'));
-    assert.ok(queued);
-    failParentRead = false;
-    child.inbox.clear();
-    child.followup(queued);
-    await child.whenIdle();
-    assert.equal(requests.length, beforeFailure + 1);
-    assert.equal(requests.at(-1).messages.filter((message) => message.source.kind === 'side-chat:sync').length, 1);
-
-    // Exercise the actual JSONL cold-read and Agent.resume path, including presets.
-    const childId = child.id;
-    assert.equal((await rpc('detach', { childId })).ok, true);
-    await handles.get(childId).dispose();
+    const replay = await rpc('open', { parentSessionId: parent.id, requestId: 'first-open' });
+    assert.equal(replay.value.childId, childId);
+    const second = await rpc('open', { parentSessionId: parent.id, requestId: 'second-open' });
+    assert.equal(second.ok, true, JSON.stringify(second));
+    assert.notEqual(second.value.childId, childId);
+    assert.equal(second.value.index, 2);
+    const nested = await rpc('open', { parentSessionId: childId, requestId: 'nested' });
+    assert.equal(nested.error.code, 'side-chat/nested');
+    assert.equal((await rpc('attach', { parentSessionId: parent.id, childId, clientId: 'fixture-window' })).ok, true);
+    assert.equal((await rpc('attach', { parentSessionId: 'wrong', childId })).error.code, 'side-chat/wrong-parent');
+    assert.equal((await rpc('close', { childId })).ok, true);
     assert.equal(root.get('agents').get(childId), undefined);
-    const coldAttach = await rpc('attach', { parentSessionId: parent.id, childId });
-    assert.equal(coldAttach.ok, true, JSON.stringify(coldAttach));
-    child = root.get('agents').get(childId);
-    child.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'after cold resume' }] }));
-    await child.whenIdle();
-    assert.equal(requests.at(-1).sessionId, childId);
-    assert.equal(requests.at(-1).messages.filter((message) => message.source.kind === 'side-chat:sync').length, 1);
+    assert.equal(root.get('sessions').get(childId), undefined);
+    assert.equal((await rpc('attach', { parentSessionId: parent.id, childId, clientId: 'fixture-window' })).error.code, 'side-chat/expired');
+    assert.ok(root.get('agents').get(second.value.childId), 'closing one side chat preserves its sibling');
+    const siblingId = second.value.childId;
+    await rpc('attach', { parentSessionId: parent.id, childId: siblingId, clientId: 'window-a' });
+    await rpc('attach', { parentSessionId: parent.id, childId: siblingId, clientId: 'window-b' });
+    async function hold(clientId) {
+      const request = Readable.from([Buffer.from(JSON.stringify({ type: 'client-request', rpcId: clientId, method: 'hold', payload: { clientId } }))]);
+      request.url = '/side-chat/hold'; request.method = 'POST'; request.headers = { 'content-type': 'application/json' };
+      const response = new EventEmitter();
+      response.writeHead = () => {};
+      response.end = () => {};
+      route.handler(request, response);
+      await new Promise((resolve) => setImmediate(resolve));
+      return response;
+    }
+    const windowA = await hold('window-a');
+    const windowB = await hold('window-b');
+    windowA.emit('close');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.ok(root.get('agents').get(siblingId), 'another window still owns this side chat');
+    windowB.emit('close');
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(root.get('agents').get(siblingId), undefined, 'last browser disconnect disposes the transient Agent');
 
-    // Opening twice cannot create two forks, and parent work is never awakened.
-    const reopened = await Promise.all([
-      rpc('open', { parentSessionId: parent.id }),
-      rpc('open', { parentSessionId: parent.id }),
-    ]);
-    assert.ok(reopened.every((result) => result.ok && result.value.childId === child.id));
+    const pendingOpen = rpc('open', { parentSessionId: parent.id, requestId: 'cancelled-open' });
+    const cancellation = rpc('cancel-open', { requestId: 'cancelled-open' });
+    const cancelled = await pendingOpen;
+    assert.equal((await cancellation).ok, true);
+    assert.equal(root.get('agents').get(cancelled.value.childId), undefined);
     assert.equal(parent.status, 'idle');
+    const diskAfter = await readdir(persistenceRoot, { recursive: true });
+    assert.ok(!diskAfter.some((name) => name.includes(childId) || name.includes(siblingId)), JSON.stringify(diskAfter));
+
   } finally {
     await root.fiber.dispose();
     await rm(persistenceRoot, { recursive: true, force: true });
