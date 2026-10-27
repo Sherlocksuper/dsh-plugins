@@ -165,10 +165,17 @@ window.__ModuleLoader__.load({
       const record = records.get(childId);
       update(childId, { closeState: record.closeState === 'silent-closing' ? 'silent-closing' : 'closing', error: null });
       try {
-        await call('close', { childId });
+        await call('close', { childId }).catch((error) => {
+          // Absence is a completed close, including expiry during the dialog.
+          // Other failures still preserve the tab for cleanup and retry.
+          if (error.code !== 'side-chat/expired') {
+            throw error;
+          }
+        });
         if (skip) {
           localStorage.setItem('sidechat.skip-close-confirmation', 'true');
         }
+        update(childId, { closed: true, expired: true, closeState: null, error: t('expired') });
         approved.add(childId);
         root.sidebarRight.closeIn(record.parentSessionId, record.tabId);
       } catch (error) {
@@ -185,6 +192,9 @@ window.__ModuleLoader__.load({
         return;
       }
       const record = records.get(parsed.childId);
+      if (record.closed === true) {
+        return;
+      }
       if (record.closeState === 'closing' || record.closeState === 'silent-closing') {
         throw new Error(t('closing'));
       }
@@ -361,6 +371,9 @@ window.__ModuleLoader__.load({
           try {
             value = await call('attach', { ...parsed, clientId: holderId });
           } catch (error) {
+            if (error.code === 'side-chat/expired') {
+              update(parsed.childId, { closed: true, expired: true, closeState: null, error: error.message });
+            }
             yield { ok: false, error: { code: error.code ?? 'side-chat/unavailable', message: error.message, details: {} } };
             return;
           }

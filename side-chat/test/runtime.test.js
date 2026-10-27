@@ -169,6 +169,7 @@ test('memory-only native forks, independent snapshots, close, and transport idem
     assert.equal((await rpc('attach', { parentSessionId: parent.id, childId, clientId: 'fixture-window' })).ok, true);
     assert.equal((await rpc('attach', { parentSessionId: 'wrong', childId })).error.code, 'side-chat/wrong-parent');
     assert.equal((await rpc('close', { childId })).ok, true);
+    assert.equal((await rpc('close', { childId })).ok, true, 'closing an already-ended side chat is idempotent');
     assert.equal(root.get('agents').get(childId), undefined);
     assert.equal(root.get('sessions').get(childId), undefined);
     assert.equal((await rpc('attach', { parentSessionId: parent.id, childId, clientId: 'fixture-window' })).error.code, 'side-chat/expired');

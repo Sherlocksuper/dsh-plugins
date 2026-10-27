@@ -212,6 +212,9 @@ async function dispatch(ctx, attached, opening, endpoint, payload) {
       throw new SideChatError('side-chat/bad-request', 'childId is required')
     }
     const binding = attached.get(childId)
+    if (endpoint === 'close' && binding === undefined) {
+      return { ok: true, value: { closed: true } }
+    }
     if (binding === undefined || binding.handle === undefined) {
       throw new SideChatError('side-chat/expired', '这段临时侧聊已结束，请新建侧聊。')
     }

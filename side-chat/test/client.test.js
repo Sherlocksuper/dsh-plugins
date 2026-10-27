@@ -245,3 +245,30 @@ test('macOS desktop shortcut passes the real DSH registration checks', {
   assert.equal(protocol.bindingIssue(binding, 'desktop', 'macos'), null)
   assert.deepEqual(Array.from(binding.modifiers), ['alt', 'meta'])
 })
+
+test('a side chat confirmed absent by attach can be closed locally without another cleanup request', async () => {
+  const f = fixture((method) => method === 'attach' ? { ok: false, error: { code: 'side-chat/expired', message: 'already ended' } } : undefined)
+  await open(f)
+  const stream = f.ctx.resource.open(address(), { signal: new AbortController().signal })
+  assert.equal((await stream.next()).value.ok, false)
+  assert.doesNotThrow(() => f.ctx.beforeClose('parent', { id: 'tab-1', contentId: address() }))
+  assert.ok(!f.events.some((event) => event.method === 'close'))
+})
+
+test('expiry during close completes the local close instead of trapping the confirmation in a retry loop', async () => {
+  const f = fixture((method) => method === 'close' ? { ok: false, error: { code: 'side-chat/expired', message: 'already ended' } } : undefined)
+  await open(f)
+  assert.throws(() => f.ctx.beforeClose('parent', { id: 'tab-1', contentId: address() }), /closeTitle/)
+  await tick()
+  assert.equal(f.events.filter((event) => event.method === 'closed').length, 1)
+})
+
+test('another tab for the same ended side chat closes locally instead of remaining in closing state', async () => {
+  const f = fixture()
+  await open(f)
+  assert.throws(() => f.ctx.beforeClose('parent', { id: 'tab-1', contentId: address() }), /closeTitle/)
+  await tick()
+  assert.equal(f.events.filter((event) => event.method === 'closed').length, 1)
+  assert.doesNotThrow(() => f.ctx.beforeClose('parent', { id: 'tab-2', contentId: address() }))
+  assert.equal(f.events.filter((event) => event.method === 'close').length, 1)
+})
