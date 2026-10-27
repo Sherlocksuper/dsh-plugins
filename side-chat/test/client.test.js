@@ -3,6 +3,8 @@ import { readFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { runInNewContext } from 'node:vm'
 import { randomUUID } from 'node:crypto'
+import { resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 
 const tick = () => new Promise((resolve) => setImmediate(resolve))
 const address = (id = 'child-1') => `dsh-resource://sidechat/session/${id}?parent=parent`
@@ -232,4 +234,24 @@ test('empty or skip-confirmation closes do not flash a confirmation modal or sub
   finish({ ok: true, value: { closed: true } })
   await tick()
   assert.equal(f.events.filter((event) => event.method === 'closed').length, 1)
+})
+
+test('shortcut defaults pass the real DSH cross-platform registration checks', {
+  skip: process.env.DSH_RUNTIME_ROOT === undefined ? 'Set DSH_RUNTIME_ROOT for the shipped shortcut protocol' : false,
+}, async () => {
+  const protocol = await import(pathToFileURL(resolve(process.env.DSH_RUNTIME_ROOT, 'node_modules/@deepseek-ai/dsh-client-shortcuts/lib/protocol.js')))
+  const f = fixture()
+  for (const runtime of ['desktop', 'web']) {
+    for (const platform of ['macos', 'windows', 'linux']) {
+      const candidate = protocol.resolveShortcutDefault(f.ctx.shortcut, runtime, platform)
+      if (candidate === undefined) {
+        continue
+      }
+      const binding = protocol.normalizeBinding(candidate, platform)
+      assert.equal(protocol.bindingIssue(binding, runtime, platform), null, `${runtime}:${platform}`)
+      if (runtime === 'web') {
+        assert.equal(protocol.isWebBindingAllowed(binding, platform), true, `${runtime}:${platform}`)
+      }
+    }
+  }
 })

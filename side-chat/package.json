@@ -1,6 +1,6 @@
 {
   "name": "@local/side-chat",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "private": true,
   "type": "module",
   "description": "Temporary side chats with snapshot forks, native DSH input, multiple tabs and no saved session logs.",

@@ -438,7 +438,6 @@ window.__ModuleLoader__.load({
               'desktop:linux': { code: 'KeyS', modifiers: ['primary', 'alt'] },
               'web:macos': { code: 'KeyS', modifiers: ['primary', 'alt'] },
               'web:windows': { code: 'KeyS', modifiers: ['primary', 'alt'] },
-              'web:linux': { code: 'KeyS', modifiers: ['primary', 'alt'] },
             },
             regions: ['page', 'editable', 'terminal'], modals: [],
             resolve: () => {
