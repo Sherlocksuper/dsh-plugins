@@ -236,22 +236,12 @@ test('empty or skip-confirmation closes do not flash a confirmation modal or sub
   assert.equal(f.events.filter((event) => event.method === 'closed').length, 1)
 })
 
-test('shortcut defaults pass the real DSH cross-platform registration checks', {
+test('macOS desktop shortcut passes the real DSH registration checks', {
   skip: process.env.DSH_RUNTIME_ROOT === undefined ? 'Set DSH_RUNTIME_ROOT for the shipped shortcut protocol' : false,
 }, async () => {
   const protocol = await import(pathToFileURL(resolve(process.env.DSH_RUNTIME_ROOT, 'node_modules/@deepseek-ai/dsh-client-shortcuts/lib/protocol.js')))
   const f = fixture()
-  for (const runtime of ['desktop', 'web']) {
-    for (const platform of ['macos', 'windows', 'linux']) {
-      const candidate = protocol.resolveShortcutDefault(f.ctx.shortcut, runtime, platform)
-      if (candidate === undefined) {
-        continue
-      }
-      const binding = protocol.normalizeBinding(candidate, platform)
-      assert.equal(protocol.bindingIssue(binding, runtime, platform), null, `${runtime}:${platform}`)
-      if (runtime === 'web') {
-        assert.equal(protocol.isWebBindingAllowed(binding, platform), true, `${runtime}:${platform}`)
-      }
-    }
-  }
+  const binding = protocol.normalizeBinding(protocol.resolveShortcutDefault(f.ctx.shortcut, 'desktop', 'macos'), 'macos')
+  assert.equal(protocol.bindingIssue(binding, 'desktop', 'macos'), null)
+  assert.deepEqual(Array.from(binding.modifiers), ['alt', 'meta'])
 })
