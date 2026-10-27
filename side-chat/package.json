@@ -1,9 +1,13 @@
 {
   "name": "@local/side-chat",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "private": true,
   "type": "module",
-  "description": "Slash-command side conversation in the right Sidebar: a temporary fork of the current conversation that is discarded when its tab closes.",
+  "description": "Side conversation with a native history fork, incremental parent synchronization, and the resident DSH composer.",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "check": "node --check index.js && node --check context.js && node --check client.js"
+  },
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
@@ -12,7 +16,9 @@
   },
   "files": [
     "index.js",
+    "context.js",
     "client.js",
+    "prompts/AGENTS.md",
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg"

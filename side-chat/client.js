@@ -17,21 +17,22 @@ window.__ModuleLoader__.load({
     const CHANNEL = '/side-chat';
     /** Side Session ids currently hosted by a tab, mapped to their owner. */
     const sideParents = new Map();
+    const starting = new Set();
 
     const zh = {
       'tab.title': '侧边栏会话',
       'command.label': '侧边栏会话',
-      'command.description': '在右侧栏打开一段临时旁支对话：继承当前对话上下文；使用期间在“未分组”里有一行，关掉标签后归档隐藏',
+      'command.description': '在右侧栏分叉当前对话，提问前同步主聊新增记录；关闭标签后归档',
       'error.start': '无法打开侧边栏会话：{message}',
-      'error.attach': '侧边栏会话已打开，但主对话上下文注入失败：{message}',
+      'error.attach': '侧聊上下文未就绪，暂时无法提问。请关闭标签后重新打开：{message}',
     };
 
     const en = {
       'tab.title': 'Side chat',
       'command.label': 'Side chat',
-      'command.description': 'Open a temporary side conversation in the right Sidebar: it inherits this conversation; while open it holds one "Ungrouped" row, and closing the tab hides it',
+      'command.description': 'Fork this conversation in the right Sidebar and sync new parent records before each question; close the tab to archive',
       'error.start': 'Cannot open the side chat: {message}',
-      'error.attach': 'The side chat opened, but injecting the main conversation context failed: {message}',
+      'error.attach': 'Side chat context is not ready. Close the tab and reopen it before asking: {message}',
     };
 
     /**
@@ -132,6 +133,9 @@ window.__ModuleLoader__.load({
      * @param t - `sidechat` translator.
      */
     async function startSideChat(ctx, parentSessionId, t) {
+      if (starting.has(parentSessionId)) {
+        return;
+      }
       const existing = sideParents.get(parentSessionId);
       if (existing !== undefined && ctx.sessions.list.getSnapshot().byId[existing] !== undefined) {
         ctx.sidebarRight.openResource(addressOf(existing, parentSessionId), {
@@ -140,38 +144,26 @@ window.__ModuleLoader__.load({
         });
         return;
       }
-      let childId;
+      starting.add(parentSessionId);
       try {
-        const parent = ctx.sessions.list.getSnapshot().byId[parentSessionId];
-        childId = await ctx.sessions.create({
-          ...parent?.cwd === undefined ? {} : { cwd: parent.cwd },
-          ...parent?.projectionValues?.agentPreset === undefined
-            ? {}
-            : { agentPreset: parent.projectionValues.agentPreset },
+        const { childId } = await callChannel(ctx, 'open', { parentSessionId });
+        sideParents.set(parentSessionId, childId);
+        try {
+          await ctx.remote.session.rename({ sessionId: childId, title: t('tab.title') });
+        } catch (error) {
+          console.warn('[side-chat] failed to title the side conversation', error);
+        }
+        ctx.sidebarRight.openResource(addressOf(childId, parentSessionId), {
+          kind: KIND,
+          preferNewPane: true,
         });
       } catch (error) {
         notifyComposer(ctx, parentSessionId, t('error.start', {
           message: error instanceof Error ? error.message : String(error),
         }));
-        return;
+      } finally {
+        starting.delete(parentSessionId);
       }
-      sideParents.set(parentSessionId, childId);
-      try {
-        await ctx.remote.session.rename({ sessionId: childId, title: t('tab.title') });
-      } catch (error) {
-        console.warn('[side-chat] failed to title the side conversation', error);
-      }
-      try {
-        await callChannel(ctx, 'attach', { parentSessionId, childId });
-      } catch (error) {
-        notifyComposer(ctx, parentSessionId, t('error.attach', {
-          message: error instanceof Error ? error.message : String(error),
-        }));
-      }
-      ctx.sidebarRight.openResource(addressOf(childId, parentSessionId), {
-        kind: KIND,
-        preferNewPane: true,
-      });
     }
 
     /**
@@ -224,7 +216,14 @@ window.__ModuleLoader__.load({
       const { tab } = useTabInfo();
       const resource = useResource(tab.contentId);
       const value = resource.value;
-      return h('div', { 'data-side-chat': '' }, h('style', null, TAB_LAYOUT_CSS), value === undefined ? null : h(SessionProvider, {
+      if (resource.status === 'failed') {
+        return h('div', { role: 'alert', style: { padding: 16 } }, resource.failure.message);
+      }
+      // Native forks retain their original roles/media in model history. Only
+      // their inherited turns are omitted from this sidebar's Chat presentation.
+      const inheritedSelectors = value?.inheritedTurns.map((turn) => `[data-side-chat="${value.sessionId}"] [data-chat-turn="${turn}"]`) ?? [];
+      const inheritedCss = inheritedSelectors.length === 0 ? '' : `${inheritedSelectors.join(',')}{display:none}`;
+      return h('div', { 'data-side-chat': value?.sessionId ?? '' }, h('style', null, TAB_LAYOUT_CSS + inheritedCss), value === undefined ? null : h(SessionProvider, {
         session: value.reference,
       }, renderSlot('sidechat.conversation', {})));
     }
@@ -243,33 +242,36 @@ window.__ModuleLoader__.load({
           if (parsed === undefined) {
             throw new Error(`side-chat: invalid side conversation address "${address}"`);
           }
-          sideParents.set(parsed.parentSessionId, parsed.sessionId);
+          let attachment;
           try {
             await root.uiWorkspace.unarchiveSession(parsed.sessionId);
-          } catch (error) {
-            console.warn('[side-chat] failed to restore the side conversation', error);
-          }
-          try {
-            await callChannel(root, 'attach', {
+            attachment = await callChannel(root, 'attach', {
               parentSessionId: parsed.parentSessionId,
               childId: parsed.sessionId,
             });
           } catch (error) {
-            console.warn('[side-chat] failed to attach the main conversation context', error);
+            yield { ok: false, error: {
+              code: 'side-chat/context-unavailable',
+              message: t('error.attach', { message: error instanceof Error ? error.message : String(error) }),
+              details: {},
+            } };
+            return;
           }
+          sideParents.set(parsed.parentSessionId, parsed.sessionId);
           const reference = ctx.sessions.retain(parsed.sessionId, {
             source: 'sideChat',
             signal: options.signal,
           });
           try {
-            yield { ok: true, value: { ...parsed, reference } };
+            yield { ok: true, value: { ...parsed, reference, inheritedTurns: attachment.inheritedTurns } };
             await waitForAbort(options.signal);
           } finally {
             reference.release();
-            sideParents.delete(parsed.parentSessionId);
-            void callChannel(root, 'detach', { childId: parsed.sessionId }).catch(() => {});
-            Promise.resolve()
-              .then(() => root.uiWorkspace.archiveSession(parsed.sessionId, { stopActivity: true }))
+            if (sideParents.get(parsed.parentSessionId) === parsed.sessionId) {
+              sideParents.delete(parsed.parentSessionId);
+            }
+            callChannel(root, 'detach', { childId: parsed.sessionId })
+              .finally(() => root.uiWorkspace.archiveSession(parsed.sessionId, { stopActivity: true }))
               .catch((error) => {
                 console.warn('[side-chat] failed to hide the closed side conversation', error);
               });

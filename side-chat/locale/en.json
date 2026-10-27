@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Side Chat",
-    "description": "Type / and pick Side Chat to open a temporary side conversation with the resident composer in the right Sidebar: it inherits the main conversation context; while open it is one \"Ungrouped\" row, and closing the tab archives it."
+    "description": "Type / and pick Side Chat to fork the main history and sync new parent records before each question, with the native composer. Closing the tab archives the conversation."
   }
 }

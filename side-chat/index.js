@@ -7,30 +7,27 @@
  * under the left sidebar's "Ungrouped" bucket while the tab is open; closing
  * the tab archives it and that row disappears again.
  *
- * What this Host half owns: the main conversation's context. It registers a
- * scoped, hidden prompt context on the side Agent's own Agent context, so each
- * request re-reads the latest main-conversation log instead of pasting a
- * snapshot into the transcript.
+ * The Host forks the completed parent history, then admits new parent records
+ * as hidden, sourced background immediately before a human side-chat prompt.
  *
  * Every request-path service is read through `ctx.get(...)`: an HTTP route
  * handler runs outside the plugin fiber, where `ctx.<service>` property access
  * throws, and a throw inside a Web route handler is fatal to the Host process.
  */
 
+import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { createSyncMessage, readSyncCursor } from './context.js'
+
 export const name = 'side-chat'
 
 /** The side Agent table and the Web carrier of the private channel. */
-export const inject = ['agents']
+export const inject = ['agents', 'sessions', 'sessionQuery', 'systemPrompt', 'workingDirectory', 'agentDefaultModel']
 
 /** Client ⇄ Host channel for context attachment. */
 const CHANNEL = '/side-chat'
 
-const MAX_DIGEST_CHARS = 12000
-const MAX_MESSAGE_CHARS = 1200
-
-const CONTEXT_PREAMBLE =
-  '你正在一段“侧栏对话”里回答用户。下面是主对话截至当前请求的最近记录摘录，只作为背景参考：' +
-  '它不是本对话里用户的发言，不要逐条回应，也不要复述这段说明本身。'
+const SIDE_CHAT_RULES = readFileSync(new URL('./prompts/AGENTS.md', import.meta.url), 'utf8')
 
 /**
  * Read one Host service without property access; request handlers run outside
@@ -48,11 +45,12 @@ function service(ctx, name) {
  * @param {import('@deepseek-ai/cordis').Context} ctx
  */
 export function apply(ctx) {
-  /** Side Agent identity → the main parent whose context it renders. */
   const attached = new Map()
+  const opening = new Map()
 
   ctx.effect(
-    () => () => {
+    () => async () => {
+      await Promise.all([...attached.values()].map(({ fork }) => fork.dispose()))
       attached.clear()
     },
     'side-chat: forget attached side sessions',
@@ -64,7 +62,7 @@ export function apply(ctx) {
         kind: 'prefix',
         path: CHANNEL,
         handler: (req, res) => {
-          void serveChannel(ctx, attached, req, res)
+          void serveChannel(ctx, attached, opening, req, res)
         },
       }),
       'side-chat: context channel',
@@ -85,17 +83,20 @@ class SideChatError extends Error {
 /**
  * Serve one Connection-shaped RPC request on the plugin's authenticated route.
  * @param {*} ctx Host context.
- * @param {Map<string, string>} attached side Session id → parent Session id.
+ * @param {Map} attached live side-chat bindings.
+ * @param {Map} opening in-flight forks keyed by parent.
  * @param {import('node:http').IncomingMessage} req node request.
  * @param {import('node:http').ServerResponse} res node response.
  * @returns {Promise<void>}
  */
-async function serveChannel(ctx, attached, req, res) {
+async function serveChannel(ctx, attached, opening, req, res) {
   try {
-    await serveChannelRequest(ctx, attached, req, res)
+    await serveChannelRequest(ctx, attached, opening, req, res)
   } catch (_error) {
     try {
-      if (!res.headersSent) res.writeHead(500)
+      if (!res.headersSent) {
+        res.writeHead(500)
+      }
       res.end()
     } catch (_unavailable) {
       // The socket is already gone.
@@ -106,12 +107,13 @@ async function serveChannel(ctx, attached, req, res) {
 /**
  * Answer one channel request after {@link serveChannel} installed its boundary.
  * @param {*} ctx Host context.
- * @param {Map<string, string>} attached side Session id → parent Session id.
+ * @param {Map} attached live side-chat bindings.
+ * @param {Map} opening in-flight forks keyed by parent.
  * @param {import('node:http').IncomingMessage} req node request.
  * @param {import('node:http').ServerResponse} res node response.
  * @returns {Promise<void>}
  */
-async function serveChannelRequest(ctx, attached, req, res) {
+async function serveChannelRequest(ctx, attached, opening, req, res) {
   const connection = service(ctx, 'connection')
   if (connection === undefined) {
     res.writeHead(503)
@@ -137,7 +139,9 @@ async function serveChannelRequest(ctx, attached, req, res) {
     return
   }
   const chunks = []
-  for await (const chunk of req) chunks.push(chunk)
+  for await (const chunk of req) {
+    chunks.push(chunk)
+  }
   let body
   try {
     body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
@@ -152,7 +156,7 @@ async function serveChannelRequest(ctx, attached, req, res) {
     res.end()
     return
   }
-  const result = await dispatch(ctx, attached, endpoint, body.payload)
+  const result = await dispatch(ctx, attached, opening, endpoint, body.payload)
   res.writeHead(200, { 'content-type': 'application/json' })
   res.end(JSON.stringify({ type: 'server-response', rpcId: body.rpcId, result }))
 }
@@ -160,18 +164,31 @@ async function serveChannelRequest(ctx, attached, req, res) {
 /**
  * Route one channel call.
  * @param {*} ctx Host context.
- * @param {Map<string, string>} attached side Session id → parent Session id.
+ * @param {Map} attached live side-chat bindings.
+ * @param {Map} opening in-flight forks keyed by parent.
  * @param {string} endpoint endpoint name.
  * @param {unknown} payload decoded payload.
  * @returns {{ ok: true, value: unknown } | { ok: false, error: object }}
  */
-function dispatch(ctx, attached, endpoint, payload) {
+async function dispatch(ctx, attached, opening, endpoint, payload) {
   try {
+    if (endpoint === 'open') {
+      const parentSessionId = readString(payload, 'parentSessionId')
+      if (parentSessionId === undefined) {
+        throw new SideChatError('side-chat/bad-request', 'parentSessionId must be a non-empty string')
+      }
+      if (!opening.has(parentSessionId)) {
+        opening.set(parentSessionId, openSideChat(ctx, attached, parentSessionId).finally(() => {
+          opening.delete(parentSessionId)
+        }))
+      }
+      return { ok: true, value: await opening.get(parentSessionId) }
+    }
     if (endpoint === 'attach') {
-      return { ok: true, value: attachContext(ctx, attached, payload) }
+      return { ok: true, value: await attachContext(ctx, attached, payload) }
     }
     if (endpoint === 'detach') {
-      return { ok: true, value: detachContext(attached, payload) }
+      return { ok: true, value: await detachContext(attached, payload) }
     }
     throw new SideChatError('side-chat/bad-request', `unknown endpoint ${JSON.stringify(endpoint)}`)
   } catch (error) {
@@ -182,104 +199,194 @@ function dispatch(ctx, attached, endpoint, payload) {
   }
 }
 
-/**
- * Register the parent conversation's hidden context on one live side Agent.
- * Registering twice for the same live Agent is a no-op.
- * @param {*} ctx Host context.
- * @param {Map<string, string>} attached side Session id → parent Session id.
- * @param {unknown} payload `{ parentSessionId, childId }`.
- * @returns {{ attached: true }}
- */
-function attachContext(ctx, attached, payload) {
+/** Fork a balanced prefix without attaching the ordinary Session to a workspace. */
+async function openSideChat(ctx, attached, parentSessionId) {
+  const agents = service(ctx, 'agents')
+  const parent = agents.get(parentSessionId)
+  if (parent === undefined) {
+    throw new SideChatError('side-chat/parent-unavailable', 'the main conversation is not live', { parentSessionId })
+  }
+  for (const [childId, binding] of attached) {
+    if (binding.parentSessionId === parentSessionId && agents.get(childId) === binding.child) {
+      return { childId }
+    }
+  }
+  const observation = await service(ctx, 'sessionQuery').observeSession(parentSessionId, { projections: 'none' })
+  let seed
+  try {
+    const events = observation.events
+    const boundary = events.findLastIndex((event) => event.type === 'turn/end')
+    seed = events.slice(0, boundary + 1)
+  } finally {
+    observation[Symbol.dispose]()
+  }
+  const childId = `session-${randomUUID()}`
+  const agentPreset = parent.ctx.get('agentPresets')?.composedPreset(parent.ctx)
+  const cwd = parent.ctx.get('workingDirectory').get(parent.session)
+  const { agent: child } = await agents.create({
+    sessionId: childId,
+    seed,
+    inheritedEventCount: seed.length,
+    meta: {
+      cwd,
+      parentSession: parentSessionId,
+      isSeeded: true,
+      ...agentPreset === undefined ? {} : { agentPreset },
+    },
+    agentOptions: modelOptions(parent.session.requestHeader()?.config ?? parent.options),
+    setup: (scope, agent) => {
+      scope.get('agentPresets')?.composeFrom(scope, parent.ctx)
+      // Forked pending prompts must never wake the child or repeat parent work.
+      agent.inbox.clear()
+      agent.session.append('working-directory/change', { cwd })
+      const sandbox = parent.ctx.get('sandboxPolicy')
+      if (sandbox !== undefined) {
+        const policy = sandbox.resolve({ session: parent.session })
+        agent.session.append('sandbox/mode', { mode: policy.mode, source: 'delegation' })
+      }
+      const approval = parent.ctx.get('approval')
+      if (approval !== undefined) {
+        agent.session.append('approval/policy', { policy: approval.effectivePolicy(parent.session) })
+      }
+    },
+  })
+  await bindContext(ctx, attached, child, parentSessionId)
+  return { childId }
+}
+
+function modelOptions(config) {
+  return {
+    provider: config.provider,
+    model: config.model,
+    ...config.reasoningEffort === undefined ? {} : { reasoningEffort: config.reasoningEffort },
+    ...config.maxTokens === undefined ? {} : { maxTokens: config.maxTokens },
+  }
+}
+
+/** An unpublished replay uses DSH's own compaction and image-offload projections. */
+function replaySnapshot(ctx, events) {
+  return service(ctx, 'sessions').prepare(`side-chat-read-${randomUUID()}`, { seed: events })
+}
+
+/** Restore a fork and its durable synchronization cursor after a page/app restart. */
+async function attachContext(ctx, attached, payload) {
   const parentSessionId = readString(payload, 'parentSessionId')
   const childId = readString(payload, 'childId')
   if (parentSessionId === undefined || childId === undefined) {
     throw new SideChatError('side-chat/bad-request', 'parentSessionId and childId must be non-empty strings')
   }
   const agents = service(ctx, 'agents')
-  const parent = agents?.get(parentSessionId)
-  const child = agents?.get(childId)
-  if (parent === undefined) {
-    throw new SideChatError('side-chat/parent-unavailable', 'the main conversation is not live', { parentSessionId })
+  const observation = await service(ctx, 'sessionQuery').observeSession(childId, { projections: 'none' })
+  try {
+    if (!observation.header.isSeeded || observation.header.parentSession !== parentSessionId) {
+      throw new SideChatError('side-chat/not-a-fork', '此会话不是该主对话的侧聊分叉，请关闭旧标签后重新打开。')
+    }
+    let child = agents.get(childId)
+    if (child === undefined) {
+      const config = replaySnapshot(ctx, observation.events).requestHeader()?.config
+        ?? service(ctx, 'agentDefaultModel').currentSelection()
+      const handle = await agents.resume({
+        resumeSessionId: childId,
+        agentOptions: modelOptions(config),
+        setup: async (scope) => {
+          if (observation.header.agentPreset !== undefined) {
+            await scope.get('agentPresets').mount(scope, observation.header.agentPreset)
+          }
+        },
+      })
+      child = handle.agent
+    }
+    return await bindContext(ctx, attached, child, parentSessionId)
+  } finally {
+    observation[Symbol.dispose]()
   }
-  if (child === undefined) {
-    throw new SideChatError('side-chat/child-unavailable', 'the side conversation is not live', { childId })
-  }
-  if (attached.get(childId) === parentSessionId) {
-    return { attached: true }
-  }
-  child.ctx.inject(['systemPrompt'], (scope) => {
-    scope.effect(
-      () => scope.systemPrompt.context({
-        name: 'side-chat:context',
-        order: 1000,
-        text: () => buildDigest(parent) ?? '',
-      }),
-      'side-chat: main conversation context',
-    )
-  })
-  attached.set(childId, parentSessionId)
-  return { attached: true }
 }
 
-/**
- * Forget one side Agent's attachment (the scoped context lives with the Agent).
- * @param {Map<string, string>} attached side Session id → parent Session id.
- * @param {unknown} payload `{ childId }`.
- * @returns {{ detached: true }}
- */
-function detachContext(attached, payload) {
+/** Install stable behavior rules and sync only when human input enters a step. */
+async function bindContext(ctx, attached, child, parentSessionId) {
+  const existing = attached.get(child.id)
+  if (existing?.child === child) {
+    return { attached: true, inheritedTurns: existing.inheritedTurns }
+  }
+  const observation = await service(ctx, 'sessionQuery').observeSession(child.id, { projections: 'none' })
+  let binding
+  try {
+    binding = {
+      child,
+      parentSessionId,
+      inheritedTurns: observation.events.slice(0, child.session.inheritedEventCount)
+        .filter((event) => event.type === 'turn/start').map((event) => event.data.turn),
+      throughSeq: readSyncCursor(observation.events, child.session.inheritedEventCount, parentSessionId),
+    }
+  } finally {
+    observation[Symbol.dispose]()
+  }
+  binding.fork = child.ctx.inject(['systemPrompt'], (scope) => {
+    scope.systemPrompt.section({
+      name: 'side-chat:instructions',
+      order: 10300,
+      text: SIDE_CHAT_RULES,
+      interpolate: false,
+    })
+    scope.on('session/event', (session, event) => {
+      if (session === child.session && event.type === 'user/message'
+        && event.data.source.kind === 'side-chat:sync') {
+        binding.throughSeq = event.data.source.throughSeq
+      }
+    })
+    scope.on('agent/pre-step', async (payload, next) => {
+      const decision = await next()
+      if (decision.kind !== 'enter' || !decision.messages.some((message) => message.source.kind === 'user')) {
+        return decision
+      }
+      let parent
+      try {
+        parent = await service(ctx, 'sessionQuery').observeSession(parentSessionId, {
+          signal: payload.signal,
+          projections: 'none',
+        })
+        if (parent.cursor <= binding.throughSeq) {
+          return decision
+        }
+        const events = parent.events
+        const snapshot = replaySnapshot(ctx, events)
+        const update = createSyncMessage(parentSessionId, binding.throughSeq, snapshot, events)
+        payload.signal.throwIfAborted()
+        if (update === undefined) {
+          return decision
+        }
+        return { ...decision, messages: [update, ...decision.messages] }
+      } catch (error) {
+        if (!payload.signal.aborted) {
+          // Admission claimed these inputs before syncing. Keep the question
+          // queued for a retry instead of silently losing it on a read failure.
+          const human = decision.messages.filter((message) => message.source.kind === 'user')
+          for (const message of human.reverse()) {
+            child.inbox.prepend('next-turn', message)
+          }
+        }
+        throw new Error(`主对话增量同步失败，本轮未请求模型：${error.message}`, { cause: error })
+      } finally {
+        parent?.[Symbol.dispose]()
+      }
+    })
+  })
+  attached.set(child.id, binding)
+  return { attached: true, inheritedTurns: binding.inheritedTurns }
+}
+
+/** Dispose the scoped rules/listeners when a tab releases this attachment. */
+async function detachContext(attached, payload) {
   const childId = readString(payload, 'childId')
   if (childId === undefined) {
     throw new SideChatError('side-chat/bad-request', 'childId must be a non-empty string')
   }
-  attached.delete(childId)
+  const binding = attached.get(childId)
+  if (binding !== undefined) {
+    attached.delete(childId)
+    await binding.fork.dispose()
+  }
   return { detached: true }
-}
-
-/**
- * One hidden Context message summarizing the main conversation, capped so a
- * long session cannot dominate the side Agent's request.
- * @param {*} parent live main Agent.
- * @returns {string | undefined} model-facing text, or undefined for an empty conversation.
- */
-function buildDigest(parent) {
-  const messages = parent.session.deriveMessages()
-  const lines = []
-  let used = 0
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const message = messages[index]
-    const role = message.role
-    if (role !== 'user' && role !== 'assistant') {
-      continue
-    }
-    if (role === 'user' && message.source?.kind !== 'user') {
-      continue
-    }
-    if (role === 'assistant' && message.source?.kind !== 'model') {
-      continue
-    }
-    const text = message.content
-      .filter((block) => block.type === 'text')
-      .map((block) => block.text)
-      .join('\n')
-      .trim()
-    if (text === '') {
-      continue
-    }
-    const clipped = text.length > MAX_MESSAGE_CHARS ? `${text.slice(0, MAX_MESSAGE_CHARS)}…` : text
-    const line = `${role === 'user' ? '用户' : '助手'}：${clipped}`
-    if (used + line.length > MAX_DIGEST_CHARS) {
-      break
-    }
-    lines.push(line)
-    used += line.length
-  }
-  if (lines.length === 0) {
-    return undefined
-  }
-  lines.reverse()
-  return `${CONTEXT_PREAMBLE}\n\n${lines.join('\n')}`
 }
 
 /**
